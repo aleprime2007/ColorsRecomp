@@ -1,0 +1,9 @@
+[submodule "tools/DolRecomp"]
+	path = tools/DolRecomp
+	url = https://github.com/aharonahdoot/DolRecomp
+[submodule "tools/StrikersRecomp"]
+	path = tools/StrikersRecomp
+	url = https://github.com/aharonahdoot/StrikersRecomp
+[submodule "tools/GXRuntime"]
+	path = tools/GXRuntime
+	url = https://github.com/aharonahdoot/GXRuntime

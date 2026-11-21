@@ -1,0 +1,12 @@
+*.log
+*.zip
+/docs/dol-sections.txt
+/docs/analyze.json
+/docs/decompile_entry.json
+
+/build/
+/.vscode/
+/docs/ghidra-out/
+/game/
+/nand/
+/tools/ghidra_12.1.4_PUBLIC
