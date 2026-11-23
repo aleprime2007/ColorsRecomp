@@ -2820,3 +2820,148 @@ The OSReport line `Failed to set home directory.` is emitted from
 loader. There is also **no font anywhere in the NAND dump** (`shared2` holds
 `SYSCONF`, `wc24/*`, `sys/net/*` only), so the game's UI text must come from
 CPK data. The font lead is closed.
+
+
+## Ruling out the remaining stall candidates
+
+Added `COLORS_POKE=<addr>:<value>[:<block>]` (one-shot guest writes, comma
+separated) for A/B testing a state hypothesis, then used the write journal on
+the objects the stall could plausibly hinge on:
+
+* **Media player object `0x8088C5A0`** - never written after initialisation, and
+  its update predicates are called exactly once (blk 28.67M). The game stopped
+  pumping the player, so the movie is *behind* the stall, not the cause.
+* **`0x80866148`** (the flag a ready worker thread busy-waits on, via
+  `0x8063A3F0`) - written exactly **once**, at init, and never cleared. Its spin
+  counter `0x808657C0` is never written either, so that thread never actually
+  runs. Poking the flag to 0 (`COLORS_POKE=0x80866148:0:30000000`) changes
+  nothing - the draw count, disc reads and frame stay identical - so it is not
+  the gate.
+* **EXI** reports the disc drive on channel 0 and no device elsewhere (normal for
+  a Wii), **DSP/AX** run exactly one callback per frame (`ai_hits=2596`,
+  `ax_hits=2604` at 2600 retraces), and **DI** has no outstanding read.
+
+The one thing that does change is the top-level frame path. Walking the main
+thread's stack at two points shows the game moving between two virtual update
+methods:
+
+```
+blk 4M  (retrace ~110): 0x80353388 <- 0x800120D8 <- 0x800118B0 <- 0x800114F4
+blk 47M (retrace ~2600): 0x80353388 <- 0x800127D0 <- 0x800124C4 <- 0x8001154C
+```
+
+`0x800114F4`/`0x8001154C` both end in `lwz r12,0(r3); lwz r12,16(r12); bctrl` -
+the game is a C++ framework dispatching virtual per-frame updates, which is why
+the stall resists symbol-free analysis. The transition itself is healthy; the
+game simply parks in the second state with an empty draw list.
+
+
+## BREAKTHROUGH: the TEV combiner formula was wrong
+
+The black screen was **not** missing content — every draw was correctly
+rasterised and then multiplied to zero by the TEV.
+
+The rasteriser used `(a * b) + (c * d)` (with `-` for the SUB op). That is not
+the GX formula. The hardware (and GXRuntime's own shader generator,
+`tools/GXRuntime/graphics/aurora/lib/gx/shader.cpp:341`) evaluates:
+
+```
+out = mix(a, b, c) + d      (GX_TEV_ADD)
+out = d - mix(a, b, c)      (GX_TEV_SUB)
+mix(a,b,c) = a*(1-c) + b*c
+```
+
+This is why `GX_MODULATE` — which the SDK sets to
+`GXSetTevColorIn(stage, GX_CC_ZERO, GX_CC_TEXC, GX_CC_RASC, GX_CC_ZERO)`
+(register `0x08F8AF`, i.e. a=ZERO b=TEXC c=RASC d=ZERO) — must yield
+`TEXC * RASC`. Under the old formula it evaluated to `0 * TEXC + RASC * 0 = 0`
+for *every* material, so the whole EFB stayed black while `draws`/`pixels`
+climbed into the millions.
+
+Fixed in `src/raster.c:tev_combine()`. Result: the game's title screen renders
+(9337 distinct colours, Sonic Colors logo, "PRESS START", "Nintendo WII",
+"© SEGA").
+
+The 1059-retrace execution checkpoint is unchanged (22,213,928 blocks,
+`draws=73180 state=649046 resources=54344 flush_fail=0`) — the fix is purely in
+the pixel shader.
+
+## The boot movie stalls, and that blocks the rest of boot
+
+With rendering fixed, the game still sat on the black loading screen because
+the **Sofdec boot movie never finishes**. Instrumentation
+(`COLORS_MEDIA_DEBUG=1 COLORS_MOVIE_DUMP=1`):
+
+* `mwPlyCreateSofdec` succeeds; the SFD handle (`player+0x58`) is valid
+  (`0x92F06560`), so the earlier "create fails" theory was wrong.
+* The movie task (`0x90B0F300`) enters state 3 and stays there forever.
+* `SFD_Decode` (`0x80175AEC` hook) returns 1 exactly **once**, then 0 for
+  every later frame.
+* The reason is the playback clock at `handle+4136`: it is **0 forever**. The
+  decoder's timestamp gate (`0x8066E870`, via `0x80674BC8`) compares the
+  frame PTS against that clock, so no later frame is ever "due".
+* The clock is refreshed by the server (`0x8066D7DC`) from the stream-time
+  callback `0x8065ED4C` (stream position, `handle+8364`), which also stays 0.
+
+Workaround: once the movie has had time to play, report end-of-stream
+(`stat = 3`) so the task leaves state 3. Implemented in `src/dbg.c` at
+`0x80175A44`; **on by default** (`COLORS_NO_SKIP_MOVIE=1` disables,
+`COLORS_MOVIE_END=<block>` tunes the 30 M block threshold).
+
+With the skip, the game reads the rest of the boot data (`ios_reads=64`,
+11.7 MiB vs 3.3 MiB), draws a real 3D title scene, and shows the title screen.
+
+## Input: what the game checks
+
+* Controller state table: `*(r13-25000) + 0x10000 - 30592 + ch*16`
+  (`FUN_8001607C`), one entry per channel.
+* Entry layout: `+0` connection status (`0xFFFFFFFF` = disconnected,
+  `0` = connected), `+12` pointer to the 16-byte pad status whose `+4` holds
+  the buttons.
+* `FUN_80016D74` (framework "any button") accepts a press when
+  `*(status+4) & 0x8000` (HOME) or `*(status+100) & 0x800` (A) — note the
+  PowerPC bit numbering: `rlwinm r0,r0,0,16,16` is mask `0x8000`.
+* Setting the status to connected and those bits makes `FUN_80016D74` return 1,
+  but the **title scene still does not advance**: it reads input through the
+  game's own input class (`0x80040838`/`0x80040880`), not through
+  `FUN_80016D74`. That path is the next thing to trace.
+
+`COLORS_FAKE_INPUT=1` is the diagnostic that writes the connected flag and
+button bits at both `0x80016D74` and `0x80040838`.
+
+
+## Performance pass (post-title-screen)
+
+Measured on the 1059-retrace checkpoint (22,213,928 blocks, 72k draws,
+883M shaded pixels), wall clock:
+
+| change | time |
+|--------|------|
+| baseline (`-O2`, per-pixel `getenv`) | 3m30s |
+| cache the per-pixel `getenv` diagnostics | 2m27s |
+| local pixel counter + inline TEV helpers | 1m12s |
+| `-O3` | 1m04s |
+| `-flto` | 1m02s |
+| `-march=native` (AVX2) | 0m57s |
+| incremental edge functions | 0m55s |
+| fast TEV paths (modulate / texture / raster) | 0m50s |
+| cache the per-block `getenv` diagnostics in `dbg_block_enter` | 0m25s |
+| `1/255` multiplies, cached texture, blend specialisation | **0m21s** |
+
+Net: **10x** on the 1059 checkpoint. The title-screen run (retrace 2600,
+116.6 M blocks, 2.88 B shaded pixels) went from ~8 minutes to **1m19s**.
+
+The dominant bug was diagnostic: `COLORS_TEV_RAS`/`COLORS_TEV_FORCE` (and later
+`COLORS_TEX_MAGENTA`/`COLORS_UV_PIXELS`) were calling `getenv()` **inside the
+per-pixel loop**. With ~2.5 billion shaded pixels that alone cost more than the
+emulator. All hot-path switches are now cached once in `raster_init()`
+(`g_opt_*`).
+
+CPU-only (no GX decode) is 18.2 s for the same 22.2 M blocks, i.e. the
+software rasteriser is the remaining cost (~39 s). The path histogram
+(`COLORS_PATH_STATS=1`) shows **every** title-screen pixel still takes the
+generic TEV path; the next step is a fast path for the dominant combiner
+(the `mix(C0, C1, TEXC)` bloom pass and `TEXC*RASC` modulate).
+
+Build flags: `-O3 -fno-strict-aliasing -flto` plus `-march=native`
+(`-DCOLORS_NATIVE_ARCH=OFF` for a portable binary).

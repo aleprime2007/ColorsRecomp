@@ -5,6 +5,7 @@
 #include "gx.h"
 
 #include <math.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -124,6 +125,15 @@ static int g_ready;
 static bool g_opt_no_depth;
 static bool g_opt_no_blend;
 static bool g_opt_white_tex;
+static bool g_opt_tev_ras;
+static bool g_opt_tev_force;
+static bool g_opt_force_tex_pass;
+static bool g_opt_tex_magenta;
+static bool g_opt_uv_pixels;
+static unsigned long long g_path_px[8];  // tex/ras/mod/generic/notev/lerp/texd/rasd
+static bool g_opt_path_stats;
+static unsigned long long g_combo_px[65536];
+static unsigned long long g_stage_px[9];
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -664,21 +674,21 @@ static f32 wrap_coord(f32 c, u32 mode) {
     }
 }
 
-static bool tex_sample(u32 slot, f32 u, f32 v, f32 out[4]) {
+static inline bool tex_sample(u32 slot, f32 u, f32 v, f32 out[4]) {
     // Geometry/transform probe: ignore image content so coverage, placement and
     // rect sizes can be checked without depending on what the title uploaded.
     if (g_opt_white_tex) {
         out[0] = out[1] = out[2] = out[3] = 1.f;
         return true;
     }
-    if (getenv("COLORS_TEX_MAGENTA") != NULL) {
+    if (g_opt_tex_magenta) {
         out[0] = 1.f; out[1] = 0.f; out[2] = 1.f; out[3] = 1.f;
         return true;
     }
     if (slot >= DOL_GX_RECOMP_TEXTURE_SLOTS)
         return false;
     Tex* t = &g_tex[slot];
-    if (!tex_decode(t)) {
+    if (t->rgba == NULL && !tex_decode(t)) {
         if (getenv("COLORS_TEX_FAIL") != NULL) {
             static u32 seen[16];
             static u32 n;
@@ -699,7 +709,7 @@ static bool tex_sample(u32 slot, f32 u, f32 v, f32 out[4]) {
         return false;
     }
 
-    if (getenv("COLORS_UV_PIXELS") != NULL) {
+    if (g_opt_uv_pixels) {
         // Treat UVs above 1 as pixel coordinates for this texture.
         if (u > 1.f && u <= (f32)t->width)
             u /= (f32)t->width;
@@ -707,19 +717,45 @@ static bool tex_sample(u32 slot, f32 u, f32 v, f32 out[4]) {
             v /= (f32)t->height;
     }
     const u32 mode = g_bp_valid[0xA0u] ? g_bp[0xA0u] : 0u;
+    const f32 fw = (f32)t->width;
+    const f32 fh = (f32)t->height;
     const f32 wu = wrap_coord(u, mode & 7u);
     const f32 wv = wrap_coord(v, (mode >> 3) & 7u);
-    u32 x = (u32)(wu * (f32)t->width);
-    u32 y = (u32)(wv * (f32)t->height);
+    u32 x = (u32)(wu * fw);
+    u32 y = (u32)(wv * fh);
     if (x >= t->width)
         x = t->width - 1u;
     if (y >= t->height)
         y = t->height - 1u;
     const u8* px = t->rgba + ((size_t)y * t->width + x) * 4u;
-    out[0] = (f32)px[0] / 255.f;
-    out[1] = (f32)px[1] / 255.f;
-    out[2] = (f32)px[2] / 255.f;
-    out[3] = (f32)px[3] / 255.f;
+    // Multiply by 1/255 instead of dividing (4 divisions per shaded texel).
+    const f32 inv255 = 1.f / 255.f;
+    out[0] = (f32)px[0] * inv255;
+    out[1] = (f32)px[1] * inv255;
+    out[2] = (f32)px[2] * inv255;
+    out[3] = (f32)px[3] * inv255;
+    return true;
+}
+
+// Sampler for the fast pixel paths: the texture object, its dimensions and
+// the wrap mode are hoisted out of the loop, so this avoids the per-pixel
+// slot lookup / decode check / BP read.
+static inline bool tex_sample_cached(const u8* rgba, u32 w, u32 h, u32 mode,
+                                     f32 u, f32 v, f32 out[4]) {
+    if (rgba == NULL || w == 0u || h == 0u)
+        return false;
+    const f32 wu = wrap_coord(u, mode & 7u);
+    const f32 wv = wrap_coord(v, (mode >> 3) & 7u);
+    u32 x = (u32)(wu * (f32)w);
+    u32 y = (u32)(wv * (f32)h);
+    if (x >= w) x = w - 1u;
+    if (y >= h) y = h - 1u;
+    const u8* px = rgba + ((size_t)y * w + x) * 4u;
+    const f32 inv255 = 1.f / 255.f;
+    out[0] = (f32)px[0] * inv255;
+    out[1] = (f32)px[1] * inv255;
+    out[2] = (f32)px[2] * inv255;
+    out[3] = (f32)px[3] * inv255;
     return true;
 }
 
@@ -731,7 +767,7 @@ static inline f32 edge(f32 ax, f32 ay, f32 bx, f32 by, f32 cx, f32 cy) {
     return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
 }
 
-static f32 tev_c_arg(u32 arg, u32 ch, const f32 prev[4], const f32 ras[4],
+static inline f32 tev_c_arg(u32 arg, u32 ch, const f32 prev[4], const f32 ras[4],
                      const f32 tex[4], const f32 konst[4]) {
     switch (arg & 0xFu) {
     case 0: return prev[ch];              // CPREV
@@ -753,7 +789,7 @@ static f32 tev_c_arg(u32 arg, u32 ch, const f32 prev[4], const f32 ras[4],
     }
 }
 
-static f32 tev_a_arg(u32 arg, const f32 prev[4], const f32 ras[4],
+static inline f32 tev_a_arg(u32 arg, const f32 prev[4], const f32 ras[4],
                      const f32 tex[4], const f32 konst[4]) {
     switch (arg & 0x7u) {
     case 0: return prev[3];
@@ -767,12 +803,17 @@ static f32 tev_a_arg(u32 arg, const f32 prev[4], const f32 ras[4],
     }
 }
 
-// (a op b) * scale + bias, then d op that (GX TEV combiner).
-// GX TEV combiner: out = (a * b) + (c * d), or (a * b) - (c * d) with the
-// subtract op. Bias is applied before the scale.
+// GX TEV combiner. The hardware (and Dolphin's shader generator) evaluates
+//     out = mix(a, b, c) + d        (ADD)
+//     out = d - mix(a, b, c)        (SUB)
+// where mix(a,b,c) = a*(1-c) + b*c. This is why GX_MODULATE
+// (a=ZERO, b=TEXC, c=RASC, d=ZERO) yields TEXC*RASC. The earlier
+// (a*b) + (c*d) form made every SDK combiner evaluate to zero. Bias is
+// applied before the scale.
 static f32 tev_combine(f32 a, f32 b, f32 c, f32 d, u32 op, u32 bias,
                        u32 scale) {
-    f32 t = (op & 1u) != 0u ? (a * b) - (c * d) : (a * b) + (c * d);
+    const f32 mix = a * (1.f - c) + b * c;
+    f32 t = (op & 1u) != 0u ? (d - mix) : (mix + d);
     if ((bias & 3u) == 1u)
         t += 0.5f;
     else if ((bias & 3u) == 2u)
@@ -786,6 +827,38 @@ static f32 tev_combine(f32 a, f32 b, f32 c, f32 d, u32 op, u32 bias,
     return t;
 }
 
+static inline f32 tev_stage0_alpha(const TevStage* t0, const f32 ras[4],
+                                   const f32 texel[4]) {
+    const f32 prev[4] = {0.f, 0.f, 0.f, 0.f};
+    f32 konst[4] = {1.f, 1.f, 1.f, 1.f};
+    const bool need_k = t0->a_a == 6u || t0->a_b == 6u ||
+                        t0->a_c == 6u || t0->a_d == 6u;
+    if (need_k) {
+        const u32 kc = t0->kc_sel & 0x1Fu;
+        const u32 ka = t0->ka_sel & 0x1Fu;
+        if (kc < 0x10u) {
+            konst[0] = g_kcolor[kc / 4u][0];
+            konst[1] = g_kcolor[kc / 4u][1];
+            konst[2] = g_kcolor[kc / 4u][2];
+        } else if (kc < 0x14u) {
+            const f32* r = g_tevreg[kc - 0x10u];
+            konst[0] = r[0]; konst[1] = r[1]; konst[2] = r[2];
+        }
+        if (ka < 0x4u)
+            konst[3] = g_kcolor[ka][3];
+        else if (ka < 0x8u)
+            konst[3] = g_tevreg[ka - 0x4u][3];
+    }
+    const f32 a = tev_a_arg(t0->a_a, prev, ras, texel, konst);
+    const f32 b = tev_a_arg(t0->a_b, prev, ras, texel, konst);
+    const f32 c = tev_a_arg(t0->a_c, prev, ras, texel, konst);
+    const f32 d = tev_a_arg(t0->a_d, prev, ras, texel, konst);
+    f32 t = tev_combine(a, b, c, d, t0->a_op, t0->a_bias, t0->a_scale);
+    if (t < 0.f) t = 0.f;
+    else if (t > 1.f) t = 1.f;
+    return t;
+}
+
 static void put_pixel(u32 x, u32 y, const f32 rgba[4]) {
     u8* dst = g_color + ((size_t)y * EFB_W + x) * 4u;
     dst[0] = (u8)(rgba[0] * 255.f + 0.5f);
@@ -795,7 +868,7 @@ static void put_pixel(u32 x, u32 y, const f32 rgba[4]) {
 }
 
 // GX blend factors (BP 0x41 src/dst factor fields).
-static f32 blend_factor(u32 factor, const f32 src[4], const f32 dst[4]) {
+static inline f32 blend_factor(u32 factor, const f32 src[4], const f32 dst[4]) {
     switch (factor & 7u) {
     case 0: return 0.f;                 // ZERO
     case 1: return 1.f;                 // ONE
@@ -811,6 +884,7 @@ static f32 blend_factor(u32 factor, const f32 src[4], const f32 dst[4]) {
 static void raster_tri(const Vtx* v0, const Vtx* v1, const Vtx* v2,
                        bool textured) {
     ++g_stats.triangles;
+    u32 pixels = 0;  // local: g_stats is a global the inner loop would reload
     const f32 area = edge(v0->sx, v0->sy, v1->sx, v1->sy, v2->sx, v2->sy);
     if (fabsf(area) < 0.0001f)
         return;
@@ -841,8 +915,13 @@ static void raster_tri(const Vtx* v0, const Vtx* v1, const Vtx* v2,
     // "raster pass-through" (out = RASC/RASA). They skip the generic combiner.
     bool fast_tex = false;
     bool fast_ras = false;
+    bool fast_mod = false;
+    bool fast_mod_tex = false;
+    bool fast_lerp = false;
+    bool fast_texd = false;
+    bool fast_rasd = false;
     u32 fast_tex_slot = 0u;
-    if (getenv("COLORS_FORCE_TEX_PASS") != NULL && textured) {
+    if (g_opt_force_tex_pass && textured) {
         fast_tex = true;
         fast_tex_slot = (g_tev_valid && g_tev[0].tex_map < 8u) ? g_tev[0].tex_map
                                                                : 0u;
@@ -864,21 +943,92 @@ static void raster_tri(const Vtx* v0, const Vtx* v1, const Vtx* v2,
         } else if (c_plain && a_plain && t0->c_a == 12u && t0->c_b == 10u &&
                    t0->a_a == 7u && t0->a_b == 5u) {
             fast_ras = true;
+        } else if (t0->c_a == 15u && t0->c_b == 8u && t0->c_c == 10u &&
+                   t0->c_d == 15u) {
+            // GX_MODULATE colour (alpha handled generically below). When the
+            // stage's texture is disabled/invalid the sampler returns 1, so
+            // the same branch degenerates to RASC.
+            fast_mod = true;
+            fast_mod_tex = t0->tex_enabled && t0->tex_map < 8u &&
+                           g_tex[t0->tex_map].valid;
+            fast_tex_slot = t0->tex_map;
+        } else if (t0->c_bias == 0u && t0->c_scale == 0u && t0->c_op == 0u &&
+                   ((t0->c_a == 8u && t0->c_b == 15u && t0->c_c == 15u &&
+                     t0->c_d == 15u) ||
+                    (t0->c_a == 15u && t0->c_b == 15u && t0->c_c == 15u &&
+                     t0->c_d == 8u)) &&
+                   t0->tex_enabled && t0->tex_map < 8u &&
+                   g_tex[t0->tex_map].valid) {
+            // Plain texture pass (TEXC through a or d).
+            fast_texd = true;
+            fast_tex_slot = t0->tex_map;
+        } else if (t0->c_bias == 0u && t0->c_scale == 0u && t0->c_op == 0u &&
+                   t0->c_a == 15u && t0->c_b == 15u && t0->c_c == 15u &&
+                   t0->c_d == 10u) {
+            // Plain raster pass (RASC through d).
+            fast_rasd = true;
+        } else if (t0->c_bias == 0u && t0->c_scale == 0u && t0->c_op == 0u &&
+                   t0->c_a == 2u && t0->c_b == 4u && t0->c_c == 8u &&
+                   t0->c_d == 15u && t0->a_bias == 0u &&
+                   t0->a_scale == 0u && t0->a_op == 0u && t0->a_a == 7u &&
+                   t0->a_b == 1u && t0->a_c == 4u && t0->a_d == 7u &&
+                   t0->tex_enabled && t0->tex_map < 8u &&
+                   g_tex[t0->tex_map].valid) {
+            // Bloom composite: colour = mix(C0, C1, TEXC), alpha = A0*TEXA.
+            fast_lerp = true;
+            fast_tex_slot = t0->tex_map;
         }
+    }
+
+    // Incremental edge functions: each edge is linear in (x, y), so evaluate
+    // it once per row and step by a constant per pixel instead of running the
+    // full cross product (two multiplies + two subtracts) for every pixel.
+    const f32 e0dx = -(v2->sy - v1->sy);
+    const f32 e1dx = -(v0->sy - v2->sy);
+    const u8* ft_rgba = NULL;
+    u32 ft_w = 0u, ft_h = 0u, ft_mode = 0u;
+    if ((fast_tex || fast_mod || fast_texd || fast_lerp) &&
+        !g_opt_white_tex && !g_opt_tex_magenta &&
+        fast_tex_slot < DOL_GX_RECOMP_TEXTURE_SLOTS) {
+        Tex* ft = &g_tex[fast_tex_slot];
+        if (ft->rgba == NULL)
+            (void)tex_decode(ft);
+        if (ft->rgba != NULL) {
+            ft_rgba = ft->rgba;
+            ft_w = ft->width;
+            ft_h = ft->height;
+            ft_mode = g_bp_valid[0xA0u] ? g_bp[0xA0u] : 0u;
+        }
+    }
+    const bool ft_ok = ft_rgba != NULL;
+
+    // Hoist the blend mode: ONE/ONE (additive) and SRCALPHA/INVSRCALPHA cover
+    // most of the title/bloom passes and avoid the per-pixel factor switch.
+    int blend_kind = 0;  // 0 none, 1 one/one, 2 srcA/invsrcA, 3 srcA/one, 4 generic
+    if (g_blend_enable && !g_opt_no_blend) {
+        const u32 bs = g_blend_src & 7u, bd = g_blend_dst & 7u;
+        if (bs == 1u && bd == 1u) blend_kind = 1;
+        else if (bs == 4u && bd == 5u) blend_kind = 2;
+        else if (bs == 4u && bd == 1u) blend_kind = 3;
+        else blend_kind = 4;
     }
 
     for (s32 y = miny; y <= maxy; y++) {
         const f32 py = (f32)y + 0.5f;
-        for (s32 x = minx; x <= maxx; x++) {
-            const f32 px = (f32)x + 0.5f;
-            const f32 w0 = edge(v1->sx, v1->sy, v2->sx, v2->sy, px, py) * inv_area;
-            const f32 w1 = edge(v2->sx, v2->sy, v0->sx, v0->sy, px, py) * inv_area;
+        const f32 px0 = (f32)minx + 0.5f;
+        f32 e0 = edge(v1->sx, v1->sy, v2->sx, v2->sy, px0, py);
+        f32 e1 = edge(v2->sx, v2->sy, v0->sx, v0->sy, px0, py);
+        size_t di = (size_t)y * EFB_W + (u32)minx;
+        for (s32 x = minx; x <= maxx; x++, di++) {
+            const f32 w0 = e0 * inv_area;
+            const f32 w1 = e1 * inv_area;
+            e0 += e0dx;
+            e1 += e1dx;
             const f32 w2 = 1.f - w0 - w1;
             if (w0 < 0.f || w1 < 0.f || w2 < 0.f)
                 continue;
 
             const f32 z = w0 * v0->sz + w1 * v1->sz + w2 * v2->sz;
-            const size_t di = (size_t)y * EFB_W + (u32)x;
             if (!g_opt_no_depth && g_depth_test) {
                 // Reversed-Z (near = 1). GX compare functions are expressed for
                 // the console's [-w, 0] depth range, so the ordering inverts.
@@ -915,8 +1065,16 @@ static void raster_tri(const Vtx* v0, const Vtx* v1, const Vtx* v2,
             }
 
             f32 col[4];
+            if (g_opt_path_stats) {
+                g_path_px[fast_tex ? 0 : fast_ras ? 1 :
+                          fast_mod ? 2 : fast_lerp ? 5 :
+                          fast_texd ? 6 : fast_rasd ? 7 :
+                          (!g_tev_valid ? 4 : 3)]++;
+            }
             if (fast_tex) {
-                if (!tex_sample(fast_tex_slot, uv[0], uv[1], col)) {
+                if (!ft_ok ||
+                    !tex_sample_cached(ft_rgba, ft_w, ft_h, ft_mode, uv[0],
+                                       uv[1], col)) {
                     col[0] = col[1] = col[2] = col[3] = 1.f;
                 }
             } else if (fast_ras) {
@@ -924,6 +1082,63 @@ static void raster_tri(const Vtx* v0, const Vtx* v1, const Vtx* v2,
                 col[1] = ras[1];
                 col[2] = ras[2];
                 col[3] = ras[3];
+            } else if (fast_mod) {
+                f32 texel[4] = {1.f, 1.f, 1.f, 1.f};
+                if (fast_mod_tex && ft_ok &&
+                    !tex_sample_cached(ft_rgba, ft_w, ft_h, ft_mode, uv[0],
+                                       uv[1], texel)) {
+                    texel[0] = texel[1] = texel[2] = texel[3] = 1.f;
+                }
+                {
+                    const TevStage* t0 = &g_tev[0];
+                    const f32 neg = t0->c_op ? -1.f : 1.f;
+                    f32 bias = 0.f;
+                    if ((t0->c_bias & 3u) == 1u) bias = 0.5f;
+                    else if ((t0->c_bias & 3u) == 2u) bias = -0.5f;
+                    f32 scale = 1.f;
+                    switch (t0->c_scale & 3u) {
+                    case 1u: scale = 2.f; break;
+                    case 2u: scale = 4.f; break;
+                    case 3u: scale = 0.5f; break;
+                    default: break;
+                    }
+                    for (u32 ch = 0; ch < 3u; ch++) {
+                        f32 t = texel[ch] * ras[ch] * neg;
+                        t = (t + bias) * scale;
+                        col[ch] = t < 0.f ? 0.f : (t > 1.f ? 1.f : t);
+                    }
+                }
+                col[3] = tev_stage0_alpha(&g_tev[0], ras, texel);
+            } else if (fast_texd) {
+                f32 texel[4];
+                if (!ft_ok ||
+                    !tex_sample_cached(ft_rgba, ft_w, ft_h, ft_mode, uv[0],
+                                       uv[1], texel)) {
+                    texel[0] = texel[1] = texel[2] = texel[3] = 1.f;
+                }
+                col[0] = texel[0];
+                col[1] = texel[1];
+                col[2] = texel[2];
+                col[3] = tev_stage0_alpha(&g_tev[0], ras, texel);
+            } else if (fast_rasd) {
+                f32 texel[4] = {1.f, 1.f, 1.f, 1.f};
+                col[0] = ras[0];
+                col[1] = ras[1];
+                col[2] = ras[2];
+                col[3] = tev_stage0_alpha(&g_tev[0], ras, texel);
+            } else if (fast_lerp) {
+                f32 texel[4];
+                if (!ft_ok ||
+                    !tex_sample_cached(ft_rgba, ft_w, ft_h, ft_mode, uv[0],
+                                       uv[1], texel)) {
+                    texel[0] = texel[1] = texel[2] = texel[3] = 1.f;
+                }
+                const f32* c0 = g_tevreg[0];
+                const f32* c1 = g_tevreg[1];
+                col[0] = c0[0] + (c1[0] - c0[0]) * texel[0];
+                col[1] = c0[1] + (c1[1] - c0[1]) * texel[1];
+                col[2] = c0[2] + (c1[2] - c0[2]) * texel[2];
+                col[3] = c0[3] * texel[3];
             } else if (!g_tev_valid) {
                 // No TEV configured yet: vertex colour modulated by tex0.
                 col[0] = ras[0];
@@ -951,7 +1166,14 @@ static void raster_tri(const Vtx* v0, const Vtx* v1, const Vtx* v2,
                     const u32 kc = ts->kc_sel & 0x1Fu;
                     const u32 ka = ts->ka_sel & 0x1Fu;
                     f32 konst[4] = {1.f, 1.f, 1.f, 1.f};
-                    if (kc < 0x10u) {
+                    const bool need_k =
+                        ts->c_a == 14u || ts->c_b == 14u ||
+                        ts->c_c == 14u || ts->c_d == 14u ||
+                        ts->a_a == 6u || ts->a_b == 6u ||
+                        ts->a_c == 6u || ts->a_d == 6u;
+                    if (!need_k) {
+                        /* no KONST selector: leave konst at 1.0 */
+                    } else if (kc < 0x10u) {
                         konst[0] = g_kcolor[kc / 4u][0];
                         konst[1] = g_kcolor[kc / 4u][1];
                         konst[2] = g_kcolor[kc / 4u][2];
@@ -1006,26 +1228,57 @@ static void raster_tri(const Vtx* v0, const Vtx* v1, const Vtx* v2,
             // ROP: blend against the framebuffer (GX cmode0), then write the
             // channels the guest enabled.
             u8* dst = g_color + di * 4u;
-            f32 dstc[4] = {(f32)dst[0] / 255.f, (f32)dst[1] / 255.f,
-                           (f32)dst[2] / 255.f, (f32)dst[3] / 255.f};
             f32 final[4];
-            if (g_blend_enable && !g_opt_no_blend) {
-                const f32 sf = blend_factor(g_blend_src, col, dstc);
-                const f32 df = blend_factor(g_blend_dst, col, dstc);
-                for (u32 ch = 0; ch < 3u; ch++) {
-                    final[ch] = g_blend_subtract ? (dstc[ch] * df - col[ch] * sf)
-                                                 : (col[ch] * sf + dstc[ch] * df);
-                    if (final[ch] < 0.f) final[ch] = 0.f;
-                    if (final[ch] > 1.f) final[ch] = 1.f;
-                }
-                final[3] = col[3];
-            } else {
+            if (blend_kind == 0) {
                 final[0] = col[0];
                 final[1] = col[1];
                 final[2] = col[2];
                 final[3] = col[3];
+            } else {
+                const f32 inv255 = 1.f / 255.f;
+                f32 dstc[4] = {(f32)dst[0] * inv255, (f32)dst[1] * inv255,
+                               (f32)dst[2] * inv255, (f32)dst[3] * inv255};
+                if (blend_kind == 1) {          // ONE / ONE
+                    for (u32 ch = 0; ch < 3u; ch++) {
+                        f32 t = col[ch] + dstc[ch];
+                        final[ch] = t > 1.f ? 1.f : t;
+                    }
+                } else if (blend_kind == 2) {   // SRCALPHA / INVSRCALPHA
+                    const f32 sa = col[3], ia = 1.f - sa;
+                    for (u32 ch = 0; ch < 3u; ch++) {
+                        f32 t = col[ch] * sa + dstc[ch] * ia;
+                        final[ch] = t < 0.f ? 0.f : (t > 1.f ? 1.f : t);
+                    }
+                } else if (blend_kind == 3) {   // SRCALPHA / ONE
+                    const f32 sa = col[3];
+                    for (u32 ch = 0; ch < 3u; ch++) {
+                        f32 t = col[ch] * sa + dstc[ch];
+                        final[ch] = t > 1.f ? 1.f : t;
+                    }
+                } else {
+                    const f32 sf = blend_factor(g_blend_src, col, dstc);
+                    const f32 df = blend_factor(g_blend_dst, col, dstc);
+                    for (u32 ch = 0; ch < 3u; ch++) {
+                        final[ch] = g_blend_subtract
+                                        ? (dstc[ch] * df - col[ch] * sf)
+                                        : (col[ch] * sf + dstc[ch] * df);
+                        if (final[ch] < 0.f) final[ch] = 0.f;
+                        if (final[ch] > 1.f) final[ch] = 1.f;
+                    }
+                }
+                final[3] = col[3];
             }
 
+            if (g_opt_tev_ras) {
+                final[0] = ras[0];
+                final[1] = ras[1];
+                final[2] = ras[2];
+                final[3] = ras[3];
+            }
+            if (g_opt_tev_force) {
+                final[0] = final[1] = final[2] = 1.f;
+                final[3] = 1.f;
+            }
             if (g_depth_update)
                 g_depth[di] = z;
             for (u32 ch = 0; ch < 4u; ch++) {
@@ -1035,14 +1288,34 @@ static void raster_tri(const Vtx* v0, const Vtx* v1, const Vtx* v2,
                     continue;
                 dst[ch] = (u8)(final[ch] * 255.f + 0.5f);
             }
-            ++g_stats.pixels;
+            ++pixels;
         }
+    }
+    g_stats.pixels += pixels;
+    if (g_opt_path_stats && pixels != 0u) {
+        if (g_tev_valid)
+            g_combo_px[(u32)((g_tev[0].c_a << 12) | (g_tev[0].c_b << 8) |
+                             (g_tev[0].c_c << 4) | g_tev[0].c_d)] += pixels;
+        if (g_num_tev_stages < 9u)
+            g_stage_px[g_num_tev_stages] += pixels;
     }
 }
 
+static double g_prof_tri;
+static inline double prof_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
 static void emit_tri(const Vtx* a, const Vtx* b, const Vtx* c, bool textured) {
     if (a->clip || b->clip || c->clip)
         return;
+    if (getenv("COLORS_RASTER_PROF") != NULL) {
+        const double t0 = prof_now();
+        raster_tri(a, b, c, textured);
+        g_prof_tri += prof_now() - t0;
+        return;
+    }
     raster_tri(a, b, c, textured);
 }
 
@@ -1053,6 +1326,42 @@ void raster_packet_draw(const DolAuroraRecompRenderDrawPacket* d) {
         fprintf(stderr, "[seq] draw fmt=%u prim=%02X n=%u tex=%08X\n",
                 d->vtx_fmt, d->primitive & 0xF8u, d->vertex_count,
                 g_tex[0].valid ? g_tex[0].address : 0u);
+    {
+        const char* dl = getenv("COLORS_DRAWLOG");
+        if (dl != NULL) {
+            const u32 lo = (u32)strtoul(dl, NULL, 0);
+            const u32 hi = (u32)strtoul(strchr(dl, ':') ? strchr(dl, ':') + 1
+                                                        : "0", NULL, 0);
+            if (g_stats.clears >= lo && (hi == 0u || g_stats.clears < hi)) {
+                static u32 dn = 0;
+                if (dn++ < 600u)
+                    fprintf(stderr,
+                            "[drawlog] p=%u fmt=%u prim=%02X n=%u vs=%u tex=%08X "
+                            "tfmt=%u %ux%u\n",
+                            g_stats.clears, d->vtx_fmt, d->primitive & 0xF8u,
+                            d->vertex_count, d->vertex_size,
+                            g_tex[0].valid ? g_tex[0].address : 0u,
+                            g_tex[0].valid ? g_tex[0].format : 0u,
+                            g_tex[0].valid ? g_tex[0].width : 0u,
+                            g_tex[0].valid ? g_tex[0].height : 0u);
+            }
+        }
+        const char* ml = getenv("COLORS_MOVIE_TEXLOG");
+        if (ml != NULL && g_tex[0].valid && g_tex[0].address >= 0x90000000u) {
+            static u32 seen[32], n;
+            bool known = false;
+            for (u32 i = 0; i < n; i++)
+                if (seen[i] == g_tex[0].address) known = true;
+            if (!known && n < 32u) {
+                seen[n++] = g_tex[0].address;
+                fprintf(stderr,
+                        "[movietex] addr=0x%08X fmt=%u %ux%u prim=%02X n=%u\n",
+                        g_tex[0].address, g_tex[0].format, g_tex[0].width,
+                        g_tex[0].height, d->primitive & 0xF8u,
+                        d->vertex_count);
+            }
+        }
+    }
     if (!g_ready || d == NULL || d->vertex_payload == NULL ||
         d->vertex_count == 0u || d->vertex_size == 0u)
         return;
@@ -1070,7 +1379,7 @@ void raster_packet_draw(const DolAuroraRecompRenderDrawPacket* d) {
         static int tn = 0;
         const char* want = getenv("COLORS_TEV_FMT");
         const bool match = want == NULL || (u32)atoi(want) == d->vtx_fmt;
-        if (tn < 8 && match) {
+        if (tn < 8 && match && g_stats.draws > 1000000u) {
             ++tn;
             fprintf(stderr, "[tev] raw C0=%06X C1=%06X gen=%06X\n",
                     g_bp_valid[0xC0] ? g_bp[0xC0] : 0u,
@@ -1926,6 +2235,12 @@ void raster_init(void) {
     g_opt_no_depth = getenv("COLORS_RASTER_NO_DEPTH") != NULL;
     g_opt_no_blend = getenv("COLORS_RASTER_NO_BLEND") != NULL;
     g_opt_white_tex = getenv("COLORS_RASTER_WHITE_TEX") != NULL;
+    g_opt_tev_ras = getenv("COLORS_TEV_RAS") != NULL;
+    g_opt_tev_force = getenv("COLORS_TEV_FORCE") != NULL;
+    g_opt_force_tex_pass = getenv("COLORS_FORCE_TEX_PASS") != NULL;
+    g_opt_tex_magenta = getenv("COLORS_TEX_MAGENTA") != NULL;
+    g_opt_uv_pixels = getenv("COLORS_UV_PIXELS") != NULL;
+    g_opt_path_stats = getenv("COLORS_PATH_STATS") != NULL;
     {
         const char* fv = getenv("COLORS_FORCE_VS_SIZE");
         if (fv != NULL)
@@ -1961,6 +2276,29 @@ static void raster_dump_pipe(void) {
 }
 
 void raster_shutdown(void) {
+    if (getenv("COLORS_RASTER_PROF") != NULL)
+        fprintf(stderr, "[prof] raster_tri=%.3fs\n", g_prof_tri);
+    if (g_opt_path_stats) {
+        fprintf(stderr,
+                "[paths] tex=%llu ras=%llu mod=%llu generic=%llu notev=%llu "
+                "lerp=%llu texd=%llu rasd=%llu\n",
+                g_path_px[0], g_path_px[1], g_path_px[2], g_path_px[3],
+                g_path_px[4], g_path_px[5], g_path_px[6], g_path_px[7]);
+        for (u32 rank = 0; rank < 12u; rank++) {
+            u32 best = 0;
+            unsigned long long bestn = 0;
+            for (u32 i = 0; i < 65536u; i++)
+                if (g_combo_px[i] > bestn) { bestn = g_combo_px[i]; best = i; }
+            if (bestn == 0) break;
+            fprintf(stderr, "[combo] a=%u b=%u c=%u d=%u px=%llu\n",
+                    best >> 12, (best >> 8) & 0xF, (best >> 4) & 0xF, best & 0xF,
+                    bestn);
+            g_combo_px[best] = 0;
+        }
+        for (u32 i = 0; i < 9u; i++)
+            if (g_stage_px[i])
+                fprintf(stderr, "[stages] n=%u px=%llu\n", i, g_stage_px[i]);
+    }
     raster_dump_pipe();
     for (u32 i = 0; i < DOL_GX_RECOMP_TEXTURE_SLOTS; i++)
         free_texture(&g_tex[i]);

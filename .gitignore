@@ -4,9 +4,10 @@
 /docs/analyze.json
 /docs/decompile_entry.json
 
-/build/
 /.vscode/
+/build/
+/docs/decomp/
 /docs/ghidra-out/
 /game/
 /nand/
-/tools/ghidra_12.1.4_PUBLIC
+/tools/ghidra_12.1.4_PUBLIC/

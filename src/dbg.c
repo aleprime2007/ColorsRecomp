@@ -59,6 +59,7 @@ static bool g_memcheck_trace;
 static const char* g_memdump_path;
 static bool g_wwatch_active;
 static u32 g_wwatch_lo, g_wwatch_hi;
+static unsigned long long g_cur_blocks;
 static u32 g_memdump_addr;
 static unsigned long long g_memdump_at;
 static u32 g_memhex_addr;
@@ -78,6 +79,27 @@ static unsigned long long g_gray_at;
 static unsigned g_gray_series = 1u;
 static unsigned g_gray_series_done;
 static unsigned long long g_gray_stride = 4000000ull;
+// Media pipeline entry points, one slot each (COLORS_MEDIA_DEBUG).
+static const u32 g_media_pcs[10] = {
+    0x8067595Cu,  // frame pump
+    0x80675200u,  // status predicate
+    0x80675148u,  // "playing" getter (*(player+0x64))
+    0x80675760u,  // command state machine
+    0x8063FB88u,  // CRI media task
+    0x80012560u,  // framework loop's movie-manager gate
+    0x80640A0Cu,  // just after mw_sfd_start_ex's reset call (r3 = result)
+    0x806409B8u,  // mw_sfd_start_ex entry
+    0x80641398u,  // mwPly create(config) entry
+    0x8064019Cu,  // FUN_806400B8: after its reset(config) call
+};
+static u32 g_media_seen[10];
+static bool g_media_debug;
+
+static u32 g_poke_addr[8];
+static u32 g_poke_value[8];
+static unsigned long long g_poke_at[8];
+static bool g_poke_done[8];
+static unsigned g_poke_count;
 static unsigned long long g_threaddump_at[8];
 static unsigned g_threaddump_count;
 static unsigned g_threaddump_done_count;
@@ -89,6 +111,24 @@ static unsigned g_wpad_hits;
 static bool g_fake_wpad;
 static u32 g_fake_wpad_btn;
 static u32 g_wpad_pc[12];
+
+// Hot-path switches (read once in dbg_init). dbg_block_enter runs for every
+// translated block, so getenv() there costs more than the emulated CPU.
+static bool g_env_movie_dump;
+static bool g_env_fake_input;
+static bool g_env_force_any;
+static bool g_env_input_debug;
+static bool g_env_fake_input_pulse;
+static bool g_env_fake_input_all;
+static bool g_env_fake_wpad_work;
+static bool g_env_sfd_pool_fix;
+static bool g_env_movie_clock;
+static u32 g_env_movie_clock_inc;
+static bool g_env_no_skip_movie;
+static unsigned long long g_env_movie_end = 30000000ull;
+static bool g_env_watch_all;
+static bool g_env_watch_from_set;
+static unsigned long long g_env_watch_from;
 
 static unsigned g_cri_enqueue_hits;
 static unsigned long long g_last_draw_blk;
@@ -159,7 +199,29 @@ void dbg_init(void) {
     g_trace_ref = getenv("COLORS_TRACE_REF") != NULL;
     g_trace_idle = getenv("COLORS_TRACE_IDLE") != NULL;
     g_sleep_log = getenv("COLORS_SLEEP_LOG") != NULL;
+    g_media_debug = getenv("COLORS_MEDIA_DEBUG") != NULL;
     g_fake_wpad = getenv("COLORS_FAKE_WPAD") != NULL;
+    g_env_movie_dump = getenv("COLORS_MOVIE_DUMP") != NULL;
+    g_env_fake_input = getenv("COLORS_FAKE_INPUT") != NULL;
+    g_env_force_any = getenv("COLORS_FORCE_ANY") != NULL;
+    g_env_input_debug = getenv("COLORS_INPUT_DEBUG") != NULL;
+    g_env_fake_input_pulse = getenv("COLORS_FAKE_INPUT_PULSE") != NULL;
+    g_env_fake_input_all = getenv("COLORS_FAKE_INPUT_ALL") != NULL;
+    g_env_fake_wpad_work = getenv("COLORS_FAKE_WPAD_WORK") != NULL;
+    g_env_sfd_pool_fix = getenv("COLORS_SFD_POOL_FIX") != NULL;
+    g_env_no_skip_movie = getenv("COLORS_NO_SKIP_MOVIE") != NULL;
+    {
+        const char* mv = getenv("COLORS_MOVIE_END");
+        if (mv != NULL)
+            g_env_movie_end = strtoull(mv, NULL, 0);
+        const char* mc = getenv("COLORS_MOVIE_CLOCK");
+        g_env_movie_clock = mc != NULL;
+        g_env_movie_clock_inc = mc != NULL ? (u32)strtoul(mc, NULL, 0) : 0u;
+        const char* wf = getenv("COLORS_WATCH_FROM");
+        g_env_watch_from_set = wf != NULL;
+        g_env_watch_from = wf != NULL ? strtoull(wf, NULL, 0) : 0ull;
+    }
+    g_env_watch_all = getenv("COLORS_WATCH_ALL") != NULL;
     {
         const char* b = getenv("COLORS_FAKE_WPAD_BTN");
         g_fake_wpad_btn = b != NULL ? (u32)strtoul(b, NULL, 0) : 0x0008u;
@@ -210,6 +272,29 @@ void dbg_init(void) {
             if (st != NULL) {
                 unsigned long long v = strtoull(st, NULL, 0);
                 if (v > 0ull) g_gray_stride = v;
+            }
+        }
+        {
+            // COLORS_POKE=<addr>:<value>[:<block>][,<addr>:<value>[:<block>]]
+            // One-shot guest memory pokes, for A/B testing a state hypothesis.
+            const char* pk = getenv("COLORS_POKE");
+            if (pk != NULL) {
+                char buf[256];
+                snprintf(buf, sizeof(buf), "%s", pk);
+                char* save = NULL;
+                for (char* tok = strtok_r(buf, ",", &save);
+                     tok != NULL && g_poke_count < 8u;
+                     tok = strtok_r(NULL, ",", &save)) {
+                    unsigned long a = 0, v = 0;
+                    unsigned long long at = 0;
+                    const int n = sscanf(tok, "%li:%li:%llu", &a, &v, &at);
+                    if (n >= 2) {
+                        g_poke_addr[g_poke_count] = (u32)a;
+                        g_poke_value[g_poke_count] = (u32)v;
+                        g_poke_at[g_poke_count] = (unsigned long long)at;
+                        g_poke_count++;
+                    }
+                }
             }
         }
         {
@@ -358,18 +443,20 @@ static void dbg_write_watch(u32 offset, u32 size, void* user) {
         return;
     // Ignore the SDK's dcbz-based block zeroing (0x8033B1AC) so the first
     // *content* write is visible.
-    if (cpu != NULL &&
+    if (!g_env_watch_all && cpu != NULL &&
         (cpu->pc == 0x8033B1ACu ||
          (cpu->pc >= 0x800046B8u && cpu->pc < 0x800046E0u)))
         return;
     static u32 n = 0;
-    if (n++ < 40u)
+    if (!g_env_watch_from_set || g_cur_blocks >= g_env_watch_from) {
+    if (n++ < 100000u)
         fprintf(stderr,
-                "[wwatch] addr=0x%08X size=%u pc=0x%08X lr=0x%08X "
+                "[wwatch] blk=%llu addr=0x%08X size=%u pc=0x%08X lr=0x%08X "
                 "before=%08X\n",
-                addr, size, cpu != NULL ? cpu->pc : 0u,
+                g_cur_blocks, addr, size, cpu != NULL ? cpu->pc : 0u,
                 cpu != NULL ? cpu->lr : 0u,
                 cpu != NULL ? mem_read32(cpu, addr & ~3u) : 0u);
+    }
 }
 
 void dbg_install_write_watch(CPUState* cpu) {
@@ -506,6 +593,26 @@ static void dbg_thread_dump(CPUState* cpu, unsigned long long blocks) {
         for (u32 off = 0x2C8u; off < 0x2E8u; off += 4u)
             fprintf(stderr, "%08X ", mem_read32(cpu, t + off));
         fprintf(stderr, "\n");
+        {
+            // Saved volatile/callee-saved registers at the switch point: r3 is
+            // the current call's first argument and r31 usually holds `this`
+            // for the framework's virtual dispatch.
+            const u32 r3 = mem_read32(cpu, t + 3u * 4u);
+            const u32 r31 = mem_read32(cpu, t + 31u * 4u);
+            if (state == 4u && (r3 != 0u || r31 != 0u)) {
+                const u32 vt = (r31 >= 0x80000000u && r31 < 0x94000000u)
+                                   ? mem_read32(cpu, r31) : 0u;
+                fprintf(stderr,
+                        "[dbg]   regs r3=0x%08X r31=0x%08X vptr=0x%08X",
+                        r3, r31, vt);
+                if (vt >= 0x80000000u && vt < 0x80800000u) {
+                    fprintf(stderr, " slots:");
+                    for (u32 i = 0; i < 8u; i++)
+                        fprintf(stderr, " %08X", mem_read32(cpu, vt + i * 4u));
+                }
+                fprintf(stderr, "\n");
+            }
+        }
         if (state == 4u) {
             // A blocking thread's OSContext holds r1 at the switch point, so the
             // stack chain names the call it is parked in.
@@ -518,7 +625,31 @@ static void dbg_thread_dump(CPUState* cpu, unsigned long long blocks) {
     fprintf(stderr, "[threads] %d thread(s)\n", n);
 }
 
+static void dbg_fake_input_write(CPUState* cpu) {
+    const u32 mgr = mem_read32(cpu, cpu->gpr[13] - 25000u);
+    if (mgr < 0x80000000u || mgr >= 0x94000000u)
+        return;
+    const u32 base = mgr + 0x10000u - 30592u;
+    for (u32 ch = 0; ch < 4u; ch++) {
+        const u32 p = mem_read32(cpu, base + ch * 16u + 12u);
+        if (p < 0x80000000u || p >= 0x94000000u)
+            continue;
+        mem_write32(cpu, base + ch * 16u, 0u);
+        mem_write32(cpu, p + 4u, mem_read32(cpu, p + 4u) | 0x8000u);
+        mem_write32(cpu, p + 100u, mem_read32(cpu, p + 100u) | 0x800u);
+    }
+}
+
 void dbg_block_enter(CPUState* cpu, u32 pc, unsigned long long blocks, u32 last_pc) {
+    g_cur_blocks = blocks;
+    for (unsigned i = 0; i < g_poke_count; i++) {
+        if (!g_poke_done[i] && blocks >= g_poke_at[i]) {
+            g_poke_done[i] = true;
+            fprintf(stderr, "[poke] 0x%08X = 0x%08X at blk=%llu\n",
+                    g_poke_addr[i], g_poke_value[i], blocks);
+            mem_write32(cpu, g_poke_addr[i], g_poke_value[i]);
+        }
+    }
     while (g_threaddump_done_count < g_threaddump_count &&
            blocks >= g_threaddump_at[g_threaddump_done_count]) {
         dbg_thread_dump(cpu, blocks);
@@ -597,8 +728,7 @@ void dbg_block_enter(CPUState* cpu, u32 pc, unsigned long long blocks, u32 last_
                 g_gray_at = blocks + g_gray_stride;
         }
     }
-    if (g_memhex_len != 0u && blocks >= g_memhex_at &&
-        (blocks & 0xFFFFFull) == 0ull) {
+    if (g_memhex_len != 0u && blocks >= g_memhex_at) {
         fprintf(stderr, "[memhex] addr=0x%08X blk=%llu:", g_memhex_addr, blocks);
         for (u32 i = 0; i < g_memhex_len; i++)
             fprintf(stderr, " %02X", mem_read8(cpu, g_memhex_addr + i));
@@ -779,8 +909,18 @@ void dbg_block_enter(CPUState* cpu, u32 pc, unsigned long long blocks, u32 last_
         // Remote so the game leaves its "connect a controller" wait.
         const u32 chan = cpu->gpr[3];
         if (chan < 4u) {
-            const u32 base = mem_read32(cpu, 0x8060A750u + chan * 4u);
+            // The SDK's per-channel work struct lives in the WPAD static
+            // array (0x80610908 + chan*1672), not the connection table at
+            // 0x8060A750 (which points into MEM2).
+            u32 base = mem_read32(cpu, 0x8060A750u + chan * 4u);
+            if (g_env_fake_wpad_work)
+                base = 0x80610908u + chan * 1672u;
             if (base >= 0x80000000u && base < 0x94000000u) {
+                static u32 wn = 0;
+                if (wn++ < 3u)
+                    fprintf(stderr,
+                            "[fakewpad] chan=%u base=0x%08X expect=0x%08X\n",
+                            chan, base, 0x80610908u + chan * 1672u);
                 mem_write32(cpu, base + 2304u, 0u);   // connected
                 mem_write8(cpu, base + 2309u, 0u);    // WPAD_DEV_CORE (remote)
                 mem_write32(cpu, base + 2336u, 0u);
@@ -791,34 +931,369 @@ void dbg_block_enter(CPUState* cpu, u32 pc, unsigned long long blocks, u32 last_
             }
         }
     }
-    if (getenv("COLORS_MEDIA_DEBUG") != NULL &&
-        (pc == 0x806759E0u || pc == 0x80675200u || pc == 0x80675148u ||
-         pc == 0x8063A3F0u)) {
-        static u32 seen[4];
-        static int n;
-        const int slot = (pc == 0x806759E0u) ? 0 : (pc == 0x80675200u) ? 1
-                       : (pc == 0x80675148u) ? 2 : 3;
-        if ((seen[slot]++ & 0xFFFu) == 0u || seen[slot] == 1u)
-            fprintf(stderr,
-                    "[media] pc=0x%08X n=%u blk=%llu r3=0x%08X r4=0x%08X "
-                    "lr=0x%08X\n",
-                    pc, seen[slot], blocks, cpu->gpr[3], cpu->gpr[4], cpu->lr);
-        (void)n;
+    if (g_env_movie_dump &&
+        (pc == 0x8017577Cu || pc == 0x80175748u)) {
+        static u32 bn = 0;
+        if (bn++ < 12u)
+            fprintf(stderr, "[moviedraw] body pc=0x%08X\n", pc);
     }
-    if (getenv("COLORS_YUV_DEBUG") != NULL &&
-        (pc == 0x8063B00Cu || pc == 0x8063AFF8u)) {
-        static u32 yn = 0;
-        if (yn++ < 6u) {
-            const u32 a = cpu->gpr[3], b = cpu->gpr[4];
+    if (g_env_movie_dump && pc == 0x80175AB4u) {
+        static u32 last = 99u;
+        const u32 st = cpu->gpr[0];
+        if (st != last) {
+            fprintf(stderr, "[moviestate] blk=%llu task=0x%08X %u -> %u\n",
+                    blocks, cpu->gpr[31], last, st);
+            last = st;
+        }
+    }
+    if (g_env_movie_dump && pc == 0x80175728u) {
+        static u32 dn = 0;
+        ++dn;
+        if (dn <= 8u || (dn & 63u) == 0u) {
+            const u32 w = cpu->gpr[3];
+            const u32 t = mem_read32(cpu, w + 8u);
             fprintf(stderr,
-                    "[yuv] blk=%llu r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X\n",
-                    blocks, a, b, cpu->gpr[5], cpu->gpr[6]);
-            for (u32 off = 0; off < 0x30u; off += 8u)
+                    "[moviedraw] n=%u blk=%llu task=0x%08X state=%u "
+                    "tex0=0x%08X tex1=0x%08X\n",
+                    dn, blocks, t, mem_read32(cpu, t + 8u),
+                    mem_read32(cpu, t + 36u), mem_read32(cpu, t + 40u));
+        }
+    }
+    if (g_env_fake_input && pc == 0x80016DD4u) {
+        static u32 n = 0;
+        if (n++ < 3u) {
+            const u32 pp = mem_read32(cpu, cpu->gpr[1] + 20u);
+            fprintf(stderr, "[fakeinput] check ptr=0x%08X v4=%08X v100=%08X\n",
+                    pp, mem_read32(cpu, pp + 4u),
+                    mem_read32(cpu, pp + 100u));
+        }
+    }
+    if (g_env_fake_input &&
+        (pc == 0x80040880u || pc == 0x800123C8u))
+        dbg_fake_input_write(cpu);
+    if (g_env_force_any && pc == 0x80012900u) {
+        cpu->gpr[3] = 1u;
+    }
+    if (g_env_fake_input && pc == 0x80012900u) {
+        static u32 n = 0;
+        if (n++ < 3u) {
+            const u32 mgr = mem_read32(cpu, cpu->gpr[13] - 25000u);
+            const u32 st = mgr + 0x10000u - 30592u;
+            const u32 pp = mem_read32(cpu, st + 12u);
+            fprintf(stderr,
+                    "[fakeinput] ret=%u st=0x%08X pp=0x%08X v4=%08X v100=%08X\n",
+                    cpu->gpr[3], st, pp, mem_read32(cpu, pp + 4u),
+                    mem_read32(cpu, pp + 100u));
+        }
+    }
+    if (g_env_input_debug && pc == 0x80016CA0u) {
+        static u32 n = 0;
+        if (n++ < 2u) {
+            const u32 m = cpu->gpr[3];
+            const u32 vt = mem_read32(cpu, m);
+            fprintf(stderr, "[input] manager=0x%08X vt=0x%08X slots:", m, vt);
+            for (u32 i = 0; i < 12u; i++)
+                fprintf(stderr, " %u:%08X", i,
+                        mem_read32(cpu, vt + i * 4u));
+            fprintf(stderr, "\n");
+        }
+    }
+    if (g_env_fake_input && pc == 0x80016D74u) {
+        // Force the game's per-channel controller state (the struct
+        // FUN_80016D74 reads) so a button press is visible even when the
+        // emulated WPAD report path never fills it.
+        const u32 mgr = mem_read32(cpu, cpu->gpr[13] - 25000u);
+        if (mgr >= 0x80000000u && mgr < 0x94000000u) {
+            const u32 base = mgr + 0x10000u - 30592u;
+            for (u32 ch = 0; ch < 4u; ch++) {
+                // Mark the channel as connected: struct+0 is the status code
+                // (0xFFFFFFFF = no controller), and FUN_80016D74 only looks
+                // at the buttons when it is 0 (or -2..-4).
+                mem_write32(cpu, base + ch * 16u, 0u);
+                const u32 p = mem_read32(cpu, base + ch * 16u + 12u);
+                if (p < 0x80000000u || p >= 0x94000000u)
+                    continue;
+                if (g_env_fake_input_pulse &&
+                    (blocks % 2000000ull) >= 200000ull) {
+                    /* release: leave the previous state untouched */
+                } else if (g_env_fake_input_all) {
+                    mem_write32(cpu, p + 4u, 0xFFFFFFFFu);
+                    mem_write32(cpu, p + 100u, 0xFFFFFFFFu);
+                } else {
+                    mem_write32(cpu, p + 4u,
+                                mem_read32(cpu, p + 4u) | 0x8000u);
+                    mem_write32(cpu, p + 100u,
+                                mem_read32(cpu, p + 100u) | 0x800u);
+                }
+            }
+            static u32 fn = 0;
+            if (fn++ < 3u) {
+                const u32 p0 = mem_read32(cpu, base + 12u);
                 fprintf(stderr,
-                        "[yuv]   a+%02X: %08X %08X | b+%02X: %08X %08X\n", off,
-                        mem_read32(cpu, a + off), mem_read32(cpu, a + off + 4u),
-                        off, mem_read32(cpu, b + off),
-                        mem_read32(cpu, b + off + 4u));
+                        "[fakeinput] mgr=0x%08X base=0x%08X p0=0x%08X "
+                        "btn=%08X b100=%08X\n",
+                        mgr, base, p0,
+                        p0 >= 0x80000000u ? mem_read32(cpu, p0 + 4u) : 0u,
+                        p0 >= 0x80000000u ? mem_read32(cpu, p0 + 100u) : 0u);
+            }
+        }
+    }
+    if (g_env_input_debug && pc == 0x80016D74u) {
+        static u32 n = 0;
+        if (n++ < 6u) {
+            const u32 mgr = mem_read32(cpu, cpu->gpr[13] - 25000u);
+            fprintf(stderr,
+                    "[input] scan arg=%u r13=0x%08X mgr=0x%08X base=0x%08X\n",
+                    cpu->gpr[3], cpu->gpr[13], mgr, mgr + 0x10000u - 30592u);
+            for (u32 ch = 0; ch < 4u; ch++) {
+                const u32 b = mgr + 0x10000u - 30592u + ch * 16u;
+                const u32 p = mem_read32(cpu, b + 12u);
+                fprintf(stderr,
+                        "[input]  ch%u: %08X %08X %08X %08X | p4=%08X p100=%08X\n",
+                        ch, mem_read32(cpu, b), mem_read32(cpu, b + 4u),
+                        mem_read32(cpu, b + 8u), p,
+                        (p >= 0x80000000u && p < 0x94000000u)
+                            ? mem_read32(cpu, p + 4u) : 0u,
+                        (p >= 0x80000000u && p < 0x94000000u)
+                            ? mem_read32(cpu, p + 100u) : 0u);
+            }
+        }
+    }
+    if (g_env_input_debug && pc == 0x80016E24u) {
+        static u32 n, yes;
+        ++n;
+        if (cpu->gpr[3] != 0u) ++yes;
+        if ((n & 1023u) == 0u || yes <= 3u)
+            fprintf(stderr, "[input] check n=%u blk=%llu r3=%u yes=%u\n",
+                    n, blocks, cpu->gpr[3], yes);
+    }
+    if (g_env_movie_dump && pc == 0x8067595Cu) {
+        static u32 n = 0;
+        if (n++ < 4u) {
+            const u32 p = cpu->gpr[5];
+            fprintf(stderr,
+                    "[pump] p3=0x%08X p4=0x%08X p5=0x%08X cb=0x%08X\n",
+                    cpu->gpr[3], cpu->gpr[4], p,
+                    p >= 0x80000000u ? mem_read32(cpu, p + 104u) : 0u);
+        }
+    }
+    if (g_env_movie_dump && pc == 0x80660418u) {
+        static u32 n = 0;
+        if (n++ < 6u) {
+            const u32 h = cpu->gpr[3];
+            const u32 si = cpu->gpr[4];
+            const u32 base = h + si * 116u;
+            fprintf(stderr,
+                    "[stream] h=0x%08X si=%u flag=0x%08X ctx=0x%08X "
+                    "a5056=0x%08X a5060=0x%08X\n",
+                    h, si, mem_read32(cpu, base + 5052u),
+                    mem_read32(cpu, base + 5124u),
+                    mem_read32(cpu, base + 5056u),
+                    mem_read32(cpu, base + 5060u));
+        }
+    }
+    if (g_env_movie_dump && pc == 0x8066F478u) {
+        static u32 fn = 0;
+        if (cpu->gpr[4] == 2u && fn++ < 6u) {
+            const u32 tbl = mem_read32(cpu, cpu->gpr[3] + cpu->gpr[4] * 68u + 8164u);
+            fprintf(stderr,
+                    "[codec] h=0x%08X idx=%u tbl=0x%08X cb=0x%08X\n",
+                    cpu->gpr[3], cpu->gpr[4], tbl,
+                    tbl >= 0x80000000u ? mem_read32(cpu, tbl + cpu->gpr[5] * 4u)
+                                       : 0u);
+        }
+    }
+    if (g_env_movie_dump && pc == 0x80674BC8u &&
+        (cpu->lr == 0x8066E8CCu || cpu->lr == 0x8066E8F4u ||
+         cpu->lr == 0x8066E988u)) {
+        static u32 n = 0;
+        if (n++ < 12u)
+            fprintf(stderr,
+                    "[range] lr=0x%08X a=%u b=%u c=%u d=%u\n",
+                    cpu->lr, cpu->gpr[3], cpu->gpr[4], cpu->gpr[5],
+                    cpu->gpr[6]);
+    }
+    // The retail Sofdec player stalls after its first frame (the playback
+    // clock never leaves 0, so no later frame is ever "due"). That leaves the
+    // boot movie spinning forever and the game stuck on the black loading
+    // screen. Treat the movie as finished once it has had time to play so the
+    // rest of boot (and the title screen) can run. Disable with
+    // COLORS_NO_SKIP_MOVIE=1, or tune the threshold with COLORS_MOVIE_END=<blk>.
+    if (!g_env_no_skip_movie && pc == 0x80175A44u &&
+        blocks >= g_env_movie_end &&
+        cpu->gpr[3] == 2u) {
+        // Experiment: pretend the SFD reached end-of-stream so the game's
+        // movie task can leave state 3 and the scene can advance.
+        static u32 n = 0;
+        if (n++ < 4u)
+            fprintf(stderr, "[movieend] force stat=3 at blk=%llu\n", blocks);
+        cpu->gpr[3] = 3u;
+    }
+    if (g_env_movie_clock && pc == 0x80175AECu) {
+        // Experiment: the SFD playback clock (handle+4136) stays at 0, so no
+        // frame after the first is ever "due". Advance it by one 32 kHz tick
+        // per decode attempt and see whether the decoder starts producing.
+        const u32 h = 0x92F06560u;
+        const u32 inc = g_env_movie_clock_inc;
+        mem_write32(cpu, h + 4136u,
+                    mem_read32(cpu, h + 4136u) + inc);
+    }
+    if (g_env_movie_dump && pc == 0x80175AECu) {
+        static u32 dec_n, dec_ok;
+        ++dec_n;
+        if (cpu->gpr[3] != 0u) ++dec_ok;
+        if ((dec_n & 63u) == 0u || dec_ok <= 3u)
+            fprintf(stderr, "[moviedec] n=%u blk=%llu r3=%u ok=%u "
+                    "hstate=%u data=%u a92=%u npic=%u pic0=%08X/%d "
+                    "a4140=%u a4136=%u a4204=%u a2644=%u tcb=%08X\n",
+                    dec_n, blocks, cpu->gpr[3], dec_ok,
+                    mem_read32(cpu, 0x92F06560u + 84u),
+                    mem_read32(cpu, 0x92F06560u + 2648u),
+                    mem_read32(cpu, 0x92F06560u + 92u),
+                    mem_read32(cpu, 0x92F06560u + 10220u),
+                    mem_read32(cpu, 0x92F06560u + 10232u),
+                    (s32)mem_read32(cpu, 0x92F06560u + 10232u + 100u),
+                    mem_read32(cpu, 0x92F06560u + 4140u),
+                    mem_read32(cpu, 0x92F06560u + 4136u),
+                    mem_read32(cpu, 0x92F06560u + 4204u),
+                    mem_read32(cpu, 0x92F06560u + 2644u),
+                    mem_read32(cpu, 0x92F06560u + 3488u));
+    }
+    if (g_env_movie_dump && pc == 0x80175AECu &&
+        cpu->gpr[3] != 0u) {
+        const u32 t = cpu->gpr[31];
+        static u32 once = 0;
+        if (once++ < 4u && t >= 0x80000000u && t < 0x94000000u) {
+            fprintf(stderr, "[movie] task=0x%08X:", t);
+            for (u32 i = 0; i < 0x40u; i += 4u)
+                fprintf(stderr, " %08X", mem_read32(cpu, t + i));
+            fprintf(stderr, "\n[movie]  buf0=0x%08X buf1=0x%08X out=0x%08X\n",
+                    mem_read32(cpu, t + 12u), mem_read32(cpu, t + 16u),
+                    mem_read32(cpu, t + 20u));
+            const u32 b0 = mem_read32(cpu, t + 12u);
+            const u32 b1 = mem_read32(cpu, t + 16u);
+            for (u32 k = 0; k < 2u; k++) {
+                const u32 b = k == 0u ? b0 : b1;
+                if (b >= 0x80000000u && b < 0x94000000u) {
+                    fprintf(stderr, "[movie]  b%u:", k);
+                    for (u32 i = 0; i < 32u; i += 4u)
+                        fprintf(stderr, " %08X", mem_read32(cpu, b + i));
+                    fprintf(stderr, "\n");
+                }
+            }
+        }
+    }
+    if (g_env_sfd_pool_fix && pc == 0x8064163Cu) {
+        // Experiment: mwPlyCreateSofdec is about to validate the config with
+        // FUN_806402CC, which reads the frame-pool descriptor from +40/+44/+48.
+        // The game only fills +24 (pointer) / +28 (size) / +16 (count), so mirror
+        // them into the descriptor the reset looks at.
+        // r29 = the config, r30 = the player object whose +8 holds the 76-byte
+        // copy mw_sfd_start_ex validates.
+        const u32 cfg = cpu->gpr[29];
+        const u32 ply = cpu->gpr[30];
+        if (cfg >= 0x80000000u && cfg < 0x94000000u &&
+            ply >= 0x80000000u && ply < 0x94000000u) {
+            const u32 ptr = mem_read32(cpu, cfg + 24u);
+            const u32 size = mem_read32(cpu, cfg + 28u);
+            const u32 count = mem_read32(cpu, cfg + 16u);
+            static u32 n = 0;
+            if (n++ < 4u)
+                fprintf(stderr,
+                        "[sfdpool] cfg=0x%08X player=0x%08X pool=0x%08X "
+                        "size=0x%X count=%u\n",
+                        cfg, ply, ptr, size, count);
+            mem_write32(cpu, ply + 8u + 40u, ptr);
+            mem_write32(cpu, ply + 8u + 44u, size);
+            mem_write32(cpu, ply + 8u + 48u, count);
+        }
+    }
+    if (g_media_debug) {
+        int slot = -1;
+        for (u32 i = 0; i < 10u; i++)
+            if (g_media_pcs[i] == pc) slot = (int)i;
+        if (slot >= 0) {
+            if ((g_media_seen[slot]++ & 0xFFFu) == 0u || g_media_seen[slot] == 1u)
+                fprintf(stderr,
+                        "[media] pc=0x%08X n=%u blk=%llu r3=0x%08X r4=0x%08X "
+                        "lr=0x%08X\n",
+                        pc, g_media_seen[slot], blocks, cpu->gpr[3], cpu->gpr[4],
+                        cpu->lr);
+            if (pc == 0x8064019Cu) {
+                const u32 c = cpu->gpr[30];
+                fprintf(stderr,
+                        "[media] builder reset -> r3=%u cfg=0x%08X "
+                        "+0=%u +16=%u +24=%u +28=%u +36=%u +40=%u +44=%u "
+                        "+48=%u\n",
+                        cpu->gpr[3], c,
+                        mem_read32(cpu, c + 0u), mem_read32(cpu, c + 16u),
+                        mem_read32(cpu, c + 24u), mem_read32(cpu, c + 28u),
+                        mem_read32(cpu, c + 36u), mem_read32(cpu, c + 40u),
+                        mem_read32(cpu, c + 44u), mem_read32(cpu, c + 48u));
+            }
+            if (pc == 0x80641398u) {
+                const u32 c = cpu->gpr[3];
+                fprintf(stderr,
+                        "[media] mwPly create(config=0x%08X) +16=%u +24=%u "
+                        "+36=%u +40=%u +44=%u +48=%u +52=%u\n",
+                        c,
+                        c >= 0x80000000u ? mem_read32(cpu, c + 16u) : 0u,
+                        c >= 0x80000000u ? mem_read32(cpu, c + 24u) : 0u,
+                        c >= 0x80000000u ? mem_read32(cpu, c + 36u) : 0u,
+                        c >= 0x80000000u ? mem_read32(cpu, c + 40u) : 0u,
+                        c >= 0x80000000u ? mem_read32(cpu, c + 44u) : 0u,
+                        c >= 0x80000000u ? mem_read32(cpu, c + 48u) : 0u,
+                        c >= 0x80000000u ? mem_read32(cpu, c + 52u) : 0u);
+                fprintf(stderr, "[media]   create lr=0x%08X chain:", cpu->lr);
+                dbg_print_pc_history();
+                fprintf(stderr, "\n");
+                fprintf(stderr, "[media]   config dump:");
+                for (u32 i = 0; i < 0x40u && c >= 0x80000000u; i += 4u)
+                    fprintf(stderr, " %08X", mem_read32(cpu, c + i));
+                fprintf(stderr, "\n");
+            }
+            if (pc == 0x806409B8u && g_media_seen[slot] == 1u) {
+                fprintf(stderr,
+                        "[media] sfd_start_ex(ctx=0x%08X, 0x%08X) lr=0x%08X "
+                        "chain:", cpu->gpr[3], cpu->gpr[4], cpu->lr);
+                dbg_print_pc_history();
+                fprintf(stderr, "\n");
+            }
+            if (pc == 0x80640A0Cu) {
+                const u32 c = cpu->gpr[25];
+                fprintf(stderr,
+                        "[media] sfd_start_ex reset -> r3=%u ctx=0x%08X "
+                        "w=%u h=%u f0=%u f1=%u f2=%u | +8=%u +12=%u "
+                        "+40=%u +44=%u +48=%u\n",
+                        cpu->gpr[3], c,
+                        mem_read32(cpu, c + 8u), mem_read32(cpu, c + 12u),
+                        mem_read32(cpu, c + 40u), mem_read32(cpu, c + 44u),
+                        mem_read32(cpu, c + 48u),
+                        mem_read32(cpu, c + 8u), mem_read32(cpu, c + 12u),
+                        mem_read32(cpu, c + 40u), mem_read32(cpu, c + 44u),
+                        mem_read32(cpu, c + 48u));
+            }
+            if (pc == 0x8063FB88u && g_media_seen[slot] == 1u) {
+                fprintf(stderr, "[media]   caller chain (oldest first):");
+                dbg_print_pc_history();
+                fprintf(stderr, "\n");
+            }
+        }
+        if (slot >= 0 && g_media_seen[slot] == 1u &&
+            cpu->gpr[3] >= 0x80000000u &&
+            cpu->gpr[3] < 0x94000000u) {
+            const u32 o = cpu->gpr[3];
+            fprintf(stderr, "[media]   object 0x%08X:", o);
+            for (u32 i = 0; i < 0xb0u; i += 4u)
+                fprintf(stderr, " %08X", mem_read32(cpu, o + i));
+            fprintf(stderr, "\n");
+            const u32 o2 = cpu->gpr[4];
+            if (o2 >= 0x80000000u && o2 < 0x94000000u) {
+                fprintf(stderr, "[media]   arg2 0x%08X:", o2);
+                for (u32 i = 0; i < 0xb0u; i += 4u)
+                    fprintf(stderr, " %08X", mem_read32(cpu, o2 + i));
+                fprintf(stderr, "\n");
+            }
         }
     }
     if (g_wwatch_active && pc == 0x80004714u) {
@@ -1563,6 +2038,16 @@ void dbg_report_final(CPUState* cpu, unsigned long long blocks, const char* stop
                 mem_read32(cpu, 0x807E0860u + (u32)i * 0x20 + 4),
                 mem_read32(cpu, 0x807E0860u + (u32)i * 0x20 + 8),
                 mem_read32(cpu, 0x807E0860u + (u32)i * 0x20 + 12));
+    }
+    if (g_media_debug) {
+        static const char* names[10] = {"pump", "status", "playing", "cmd_fsm",
+                                       "cri_task", "mgr_gate", "sfd_reset",
+                                       "sfd_start", "mwply_create",
+                                       "build_reset"};
+        fprintf(stderr, "[dbg] media calls:");
+        for (u32 i = 0; i < 10u; i++)
+            fprintf(stderr, " %s=%u", names[i], g_media_seen[i]);
+        fprintf(stderr, "\n");
     }
     fprintf(stderr, "[run] recent block entry PCs (oldest first):");
     dbg_print_pc_history();

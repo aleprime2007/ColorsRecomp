@@ -16,7 +16,15 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
 endif()
 
-add_compile_options(-O2 -fno-strict-aliasing)
+add_compile_options(-O3 -fno-strict-aliasing -flto)
+add_link_options(-flto)
+
+# Tune for the host CPU (AVX2/FMA auto-vectorisation in the software
+# rasteriser). Disable with -DCOLORS_NATIVE_ARCH=OFF for a portable binary.
+option(COLORS_NATIVE_ARCH "Optimize for the build machine's CPU" ON)
+if(COLORS_NATIVE_ARCH)
+    add_compile_options(-march=native)
+endif()
 
 # ---------------------------------------------------------------------------
 # Runtime: GXRuntime (CPU, guest memory, devices, retail GX frontend + gxcore).

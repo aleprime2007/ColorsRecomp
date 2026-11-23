@@ -134,7 +134,9 @@ static bool gx_packet(void* user, const DolAuroraRecompRenderPacket* packet) {
                         (unsigned long long)0);
         }
         raster_packet_draw(&packet->draw);
-        if (g_draws_logged < 4u) {
+        if (g_draws_logged < 4u ||
+            (getenv("COLORS_GX_DRAWLOG") != NULL &&
+             (g_stats.draws % 5000u) == 0u)) {
             g_draws_logged++;
             fprintf(stderr,
                     "[gx] draw #%u primitive=%u vtx_fmt=%u verts=%u size=%u "

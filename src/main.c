@@ -159,7 +159,6 @@ int main(int argc, char** argv) {
             pc += 0x80000000u;                       // MEM2 physical
         cpu.pc = pc;
         dbg_pc_push(pc);
-
         dbg_block_enter(&cpu, pc, blocks, last_pc);
 
         // Idle fast-forward: the OS idle thread spins on an empty poll queue
